@@ -3,72 +3,117 @@ import { db } from "./db.js";
 export const identifyContact = async (req, res) => {
   const { email, phoneNumber } = req.body;
 
+  // ❌ Require at least one field
   if (!email && !phoneNumber) {
     return res.status(400).json({ error: "Email or phoneNumber required" });
   }
 
   try {
-    // 1️⃣ Find matching contacts
-    const [contacts] = await db.execute(
-      `SELECT * FROM Contact 
-       WHERE email = ? OR phoneNumber = ?`,
-      [email, phoneNumber]
-    );
+    // 🟡 1️⃣ Build safe query based on provided fields
+    let query = "SELECT * FROM Contact WHERE ";
+    let params = [];
 
-    // 🟢 CASE 1: No contacts found → create primary
-    if (contacts.length === 0) {
+    if (email && phoneNumber) {
+      query += "email = ? OR phoneNumber = ?";
+      params = [email, phoneNumber];
+    } else if (email) {
+      query += "email = ?";
+      params = [email];
+    } else {
+      query += "phoneNumber = ?";
+      params = [phoneNumber];
+    }
+
+    const [matched] = await db.execute(query, params);
+
+    // 🟢 2️⃣ CASE: No match → create PRIMARY
+    if (matched.length === 0) {
       const [result] = await db.execute(
         `INSERT INTO Contact (email, phoneNumber, linkPrecedence)
          VALUES (?, ?, 'primary')`,
-        [email, phoneNumber]
+        [email || null, phoneNumber || null]
       );
 
       return res.json({
         contact: {
           primaryContactId: result.insertId,
-          emails: [email],
-          phoneNumbers: [phoneNumber],
+          emails: email ? [email] : [],
+          phoneNumbers: phoneNumber ? [phoneNumber] : [],
           secondaryContactIds: [],
         },
       });
     }
 
-    // 2️⃣ Find primary contact (oldest)
-    let primary = contacts.find(c => c.linkPrecedence === "primary");
+    // 🔵 3️⃣ Resolve true root primary for each matched contact
+    const resolvePrimary = async (contact) => {
+      let current = contact;
+      while (current.linkedId) {
+        const [[parent]] = await db.execute(
+          `SELECT * FROM Contact WHERE id = ?`,
+          [current.linkedId]
+        );
+        current = parent;
+      }
+      return current;
+    };
 
-    if (!primary) {
-      primary = contacts.sort((a, b) => a.createdAt - b.createdAt)[0];
+    const primaryMap = new Map();
+
+    for (const contact of matched) {
+      const root = await resolvePrimary(contact);
+      primaryMap.set(root.id, root);
     }
 
-    // 3️⃣ Check if new info needs a secondary
-    const emailExists = contacts.some(c => c.email === email);
-    const phoneExists = contacts.some(c => c.phoneNumber === phoneNumber);
+    let primaries = Array.from(primaryMap.values());
 
-    if (!emailExists || !phoneExists) {
+    // 🔴 4️⃣ MERGE if multiple primaries
+    primaries.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+    const truePrimary = primaries[0];
+
+    if (primaries.length > 1) {
+      const otherPrimaryIds = primaries.slice(1).map(p => p.id);
+
       await db.execute(
-        `INSERT INTO Contact (email, phoneNumber, linkedId, linkPrecedence)
-         VALUES (?, ?, ?, 'secondary')`,
-        [email, phoneNumber, primary.id]
+        `UPDATE Contact
+         SET linkPrecedence='secondary', linkedId=?
+         WHERE id IN (${otherPrimaryIds.map(() => "?").join(",")})`,
+        [truePrimary.id, ...otherPrimaryIds]
       );
     }
 
-    // 4️⃣ Fetch all linked contacts
-    const [allContacts] = await db.execute(
-      `SELECT * FROM Contact 
-       WHERE id = ? OR linkedId = ?`,
-      [primary.id, primary.id]
+    // 🟣 5️⃣ Insert new secondary if exact combination does NOT exist
+    const comboExists = matched.some(
+      c => c.email === email && c.phoneNumber === phoneNumber
     );
 
-    const emails = [...new Set(allContacts.map(c => c.email).filter(Boolean))];
-    const phones = [...new Set(allContacts.map(c => c.phoneNumber).filter(Boolean))];
-    const secondaryIds = allContacts
-      .filter(c => c.linkPrecedence === "secondary")
+    if (!comboExists) {
+      await db.execute(
+        `INSERT INTO Contact (email, phoneNumber, linkedId, linkPrecedence)
+         VALUES (?, ?, ?, 'secondary')`,
+        [email || null, phoneNumber || null, truePrimary.id]
+      );
+    }
+
+    // 🟠 6️⃣ Fetch FULL cluster (handles transitive links)
+    const [cluster] = await db.execute(
+      `SELECT * FROM Contact
+       WHERE id = ?
+          OR linkedId = ?
+          OR linkedId IN (SELECT id FROM Contact WHERE linkedId = ?)`,
+      [truePrimary.id, truePrimary.id, truePrimary.id]
+    );
+
+    // 🟢 7️⃣ Consolidate data
+    const emails = [...new Set(cluster.map(c => c.email).filter(Boolean))];
+    const phones = [...new Set(cluster.map(c => c.phoneNumber).filter(Boolean))];
+    const secondaryIds = cluster
+      .filter(c => c.id !== truePrimary.id)
       .map(c => c.id);
 
-    // 5️⃣ Response
-    res.json({
+    // 🟢 8️⃣ Response
+    return res.json({
       contact: {
-        primaryContactId: primary.id,
+        primaryContactId: truePrimary.id,
         emails,
         phoneNumbers: phones,
         secondaryContactIds: secondaryIds,
@@ -76,7 +121,7 @@ export const identifyContact = async (req, res) => {
     });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
+    console.error("❌ Identify Error:", err);
+    return res.status(500).json({ error: "Server error" });
   }
 };
